@@ -34,5 +34,5 @@ npm start
    - `NODE_ENV`: `production`
    - `CLIENT_URL`: `https://your-wrms-frontend.vercel.app` (your Vercel frontend URL or `*`)
 7. Click **Create Web Service**!
-8. Render will provision the service and provide an HTTPS URL (e.g., `https://wrms-backend.onrender.com`).
-9. Health check will automatically verify via `GET /api/health`.
+8. Render will provision the service and provide an HTTPS URL (e.g., `https://wrms-backend-2m6u.onrender.com`).
+9. Health check: `https://wrms-backend-2m6u.onrender.com/api/health`.
