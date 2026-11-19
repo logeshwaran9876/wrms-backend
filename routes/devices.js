@@ -1246,12 +1246,38 @@ router.post('/:id/sync', async (req, res) => {
   }
 });
 
-// DELETE device
+// DELETE device (matches by id, deviceId, or machine name)
 router.delete('/:id', async (req, res) => {
   try {
-    const deleted = await Device.findOneAndDelete({ id: req.params.id });
+    const target = req.params.id;
+    const deleted = await Device.findOneAndDelete({
+      $or: [
+        { id: target },
+        { deviceId: target },
+        { name: target },
+        { name: new RegExp(`^${target}$`, 'i') },
+      ],
+    });
     if (!deleted) return res.status(404).json({ message: 'Device not found' });
-    res.json({ message: 'Device deleted successfully', id: req.params.id });
+
+    // Clean up any device-specific rules & audit
+    await Promise.all([
+      WebsiteRule.deleteMany({ scope: 'device', scopeTarget: { $in: [deleted.deviceId, deleted.id, deleted.name] } }).catch(() => {}),
+      ApplicationRule.deleteMany({ scope: 'device', scopeTarget: { $in: [deleted.deviceId, deleted.id, deleted.name] } }).catch(() => {}),
+      UsbRule.deleteMany({ scope: 'device', scopeTarget: { $in: [deleted.deviceId, deleted.id, deleted.name] } }).catch(() => {}),
+      BrowserRule.deleteMany({ scope: 'device', scopeTarget: { $in: [deleted.deviceId, deleted.id, deleted.name] } }).catch(() => {}),
+      AuditLog.create({
+        id: `log-${Date.now().toString().slice(-6)}`,
+        action: 'device_deleted',
+        category: 'devices',
+        target: deleted.name,
+        user: 'WRMS Uninstaller',
+        timestamp: new Date().toISOString(),
+        details: `Workstation ${deleted.name} (${deleted.deviceId}) uninstalled and permanently removed from fleet database`,
+      }).catch(() => {}),
+    ]);
+
+    res.json({ message: 'Device deleted successfully', device: deleted });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
