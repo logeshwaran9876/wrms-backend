@@ -30,8 +30,21 @@ export async function findOrCreateEmployeeForDevice({
 
   // 2. Determine target name
   let targetName = (employeeName || '').trim();
+  if (
+    targetName.endsWith('$') ||
+    targetName.toUpperCase() === 'SYSTEM' ||
+    targetName.toUpperCase() === 'LOCAL SERVICE' ||
+    targetName.toUpperCase() === 'NETWORK SERVICE'
+  ) {
+    // If it's a machine/service account, prefer an existing real employee or 'Logesh'
+    const humanUser = await User.findOne({ name: { $not: { $regex: /\$$/ } }, role: 'employee' });
+    if (humanUser) {
+      return humanUser;
+    }
+    targetName = 'Logesh';
+  }
   if (!targetName && deviceName) {
-    targetName = `${deviceName} User`;
+    targetName = 'Employee';
   }
   if (!targetName) {
     targetName = 'Employee';
