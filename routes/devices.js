@@ -6,10 +6,93 @@ import { ApplicationRule } from '../models/ApplicationRule.js';
 import { UsbRule } from '../models/UsbRule.js';
 import { BrowserRule } from '../models/BrowserRule.js';
 import { AuditLog } from '../models/AuditLog.js';
+import { DeviceSoftware } from '../models/DeviceSoftware.js';
+import { MasterPort } from '../models/MasterPort.js';
 import { normalizeDomain } from './websiteRules.js';
 import { normalizeExecutable } from './applicationRules.js';
 
 const router = express.Router();
+
+/**
+ * Automatically resolves Public IP & Geo-Location (City, Region, Country, ISP)
+ * Queries free high-reliability geolocation service with rapid timeout.
+ */
+export async function resolveDeviceLocation(ip) {
+  try {
+    const isPrivate = !ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.');
+    const url = isPrivate ? 'http://ip-api.com/json' : `http://ip-api.com/json/${ip}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.status === 'success') {
+        return {
+          publicIp: data.query || '',
+          location: {
+            city: data.city || '',
+            region: data.regionName || data.region || '',
+            country: data.country || '',
+            countryCode: data.countryCode || '',
+            isp: data.isp || '',
+          },
+        };
+      }
+    }
+  } catch (err) {
+    // Network or timeout
+  }
+  return null;
+}
+
+/**
+ * Evaluates active listening ports against Master Allowed Ports baseline.
+ */
+export async function evaluatePorts(openPortsList, blockedPorts = []) {
+  if (!Array.isArray(openPortsList)) return { ports: [], total: 0, disallowed: 0 };
+
+  let masterPorts = await MasterPort.find({ active: true }).lean().catch(() => []);
+  if (!masterPorts || masterPorts.length === 0) {
+    masterPorts = [
+      { port: 80, protocol: 'TCP' },
+      { port: 443, protocol: 'TCP' },
+      { port: 53, protocol: 'UDP' },
+      { port: 123, protocol: 'UDP' },
+      { port: 22, protocol: 'TCP' },
+      { port: 3000, protocol: 'TCP' },
+      { port: 5000, protocol: 'TCP' },
+      { port: 5173, protocol: 'TCP' },
+    ];
+  }
+  const allowedSet = new Set(masterPorts.map((p) => Number(p.port)));
+  const blockedSet = new Set(
+    (blockedPorts || []).map((p) => (typeof p === 'number' ? p : Number(p.port || p.Port)))
+  );
+
+  let disallowedCount = 0;
+  const evaluated = openPortsList.map((item) => {
+    const portNum = typeof item === 'number' ? item : Number(item.port || item.Port);
+    const proto = (item.protocol || item.Protocol || 'TCP').toUpperCase();
+    const proc = item.processName || item.ProcessName || '';
+    const isBlocked = blockedSet.has(portNum) || item.isBlocked === true;
+    const isAllowed = !isBlocked && allowedSet.has(portNum);
+    if (!isAllowed) disallowedCount++;
+    return {
+      port: portNum,
+      protocol: proto,
+      processName: proc,
+      isAllowed,
+      isBlocked,
+    };
+  });
+
+  return {
+    ports: evaluated,
+    total: evaluated.length,
+    disallowed: disallowedCount,
+  };
+}
 
 /**
  * Automatically find or create an employee for a device.
@@ -30,24 +113,13 @@ export async function findOrCreateEmployeeForDevice({
 
   // 2. Determine target name
   let targetName = (employeeName || '').trim();
-  if (
+  const isServiceOrMachine =
+    !targetName ||
     targetName.endsWith('$') ||
-    targetName.toUpperCase() === 'SYSTEM' ||
-    targetName.toUpperCase() === 'LOCAL SERVICE' ||
-    targetName.toUpperCase() === 'NETWORK SERVICE'
-  ) {
-    // If it's a machine/service account, prefer an existing real employee or 'Logesh'
-    const humanUser = await User.findOne({ name: { $not: { $regex: /\$$/ } }, role: 'employee' });
-    if (humanUser) {
-      return humanUser;
-    }
-    targetName = 'Logesh';
-  }
-  if (!targetName && deviceName) {
-    targetName = 'Employee';
-  }
-  if (!targetName) {
-    targetName = 'Employee';
+    ['SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE'].includes(targetName.toUpperCase());
+
+  if (isServiceOrMachine) {
+    targetName = deviceName ? `${deviceName} User` : 'Workstation User';
   }
 
   // 3. Check if user ALREADY exists by name (case-insensitive) or email
@@ -117,7 +189,108 @@ router.get('/', async (req, res) => {
       ];
     }
     const devices = await Device.find(filter).sort({ name: 1 });
+    
+    // Auto-resolve missing location or public IP
+    for (const d of devices) {
+      if (!d.location || !d.location.city || !d.publicIp) {
+        resolveDeviceLocation(d.ipAddress).then(async (locInfo) => {
+          if (locInfo) {
+            d.publicIp = locInfo.publicIp;
+            d.location = locInfo.location;
+            await d.save().catch(() => {});
+          }
+        }).catch(() => {});
+      }
+    }
+
     res.json(devices);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ==========================================
+// Master Allowed Ports Baseline Endpoints (Defined before /:id)
+// ==========================================
+
+router.get('/master-ports', async (req, res) => {
+  try {
+    let ports = await MasterPort.find().sort({ port: 1 }).lean();
+    if (!ports || ports.length === 0) {
+      const defaults = [
+        { port: 80, protocol: 'TCP', serviceName: 'HTTP', description: 'Standard Web Traffic', isDefault: true, active: true },
+        { port: 443, protocol: 'TCP', serviceName: 'HTTPS', description: 'Secure Web Traffic', isDefault: true, active: true },
+        { port: 53, protocol: 'UDP', serviceName: 'DNS', description: 'Domain Name Resolution', isDefault: true, active: true },
+        { port: 123, protocol: 'UDP', serviceName: 'NTP', description: 'Network Time Sync', isDefault: true, active: true },
+        { port: 22, protocol: 'TCP', serviceName: 'SSH', description: 'Secure Shell Remote', isDefault: true, active: true },
+        { port: 3000, protocol: 'TCP', serviceName: 'Dev Server', description: 'Frontend Development', isDefault: true, active: true },
+        { port: 5000, protocol: 'TCP', serviceName: 'WRMS Backend', description: 'WRMS Central API', isDefault: true, active: true },
+        { port: 5173, protocol: 'TCP', serviceName: 'Vite HMR', description: 'Frontend Dev Server', isDefault: true, active: true },
+      ];
+      for (const p of defaults) {
+        await MasterPort.findOneAndUpdate({ port: p.port }, p, { upsert: true });
+      }
+      ports = await MasterPort.find().sort({ port: 1 }).lean();
+    }
+    res.json(ports);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.post('/master-ports', async (req, res) => {
+  try {
+    const { port, protocol, serviceName, description } = req.body;
+    const portNum = Number(port);
+    if (!portNum) return res.status(400).json({ message: 'port number is required' });
+    const created = await MasterPort.findOneAndUpdate(
+      { port: portNum },
+      {
+        port: portNum,
+        protocol: (protocol || 'TCP').toUpperCase(),
+        serviceName: serviceName || `Port ${portNum} Service`,
+        description: description || 'Master allowed port baseline',
+        active: true,
+      },
+      { upsert: true, new: true }
+    );
+
+    // Re-evaluate openPorts on all devices
+    const devices = await Device.find();
+    for (const d of devices) {
+      if (Array.isArray(d.openPorts) && d.openPorts.length > 0) {
+        const { ports, total, disallowed } = await evaluatePorts(d.openPorts, d.blockedPorts || []);
+        d.openPorts = ports;
+        d.openPortsCount = total;
+        d.disallowedPortsCount = disallowed;
+        await d.save();
+      }
+    }
+
+    res.status(201).json(created);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.delete('/master-ports/:port', async (req, res) => {
+  try {
+    const portNum = Number(req.params.port);
+    await MasterPort.findOneAndDelete({ port: portNum });
+
+    // Re-evaluate openPorts on all devices
+    const devices = await Device.find();
+    for (const d of devices) {
+      if (Array.isArray(d.openPorts) && d.openPorts.length > 0) {
+        const { ports, total, disallowed } = await evaluatePorts(d.openPorts, d.blockedPorts || []);
+        d.openPorts = ports;
+        d.openPortsCount = total;
+        d.disallowedPortsCount = disallowed;
+        await d.save();
+      }
+    }
+
+    res.json({ message: `Port ${portNum} removed from Master Allowed baseline` });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -127,9 +300,17 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const device = await Device.findOne({
-      $or: [{ id: req.params.id }, { deviceId: req.params.id }]
+      $or: [{ id: req.params.id }, { deviceId: req.params.id }, { name: req.params.id }]
     });
     if (!device) return res.status(404).json({ message: 'Device not found' });
+    if (!device.location || !device.location.city || !device.publicIp) {
+      const locInfo = await resolveDeviceLocation(device.ipAddress);
+      if (locInfo) {
+        device.publicIp = locInfo.publicIp;
+        device.location = locInfo.location;
+        await device.save().catch(() => {});
+      }
+    }
     res.json(device);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -869,6 +1050,21 @@ router.post('/register', async (req, res) => {
       departmentId: 'd-003', // Development or default
     });
 
+    // Extract network, security, and hardware telemetry
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().replace('::ffff:', '');
+    const isLoopback = clientIp === '127.0.0.1' || clientIp === '::1';
+    const ipAddress = req.body.ipAddress || req.body.IpAddress || (!isLoopback ? clientIp : '');
+    const publicIp = req.body.publicIp || req.body.PublicIp || '';
+    const macAddress = req.body.macAddress || req.body.MacAddress || '';
+    const location = req.body.location || req.body.Location || null;
+    const firewallStatus = req.body.firewallStatus || req.body.FirewallStatus || 'enabled';
+    const firewallEnabled = req.body.firewallEnabled !== undefined
+      ? req.body.firewallEnabled
+      : (req.body.FirewallEnabled !== undefined ? req.body.FirewallEnabled : true);
+
+    const rawPorts = req.body.openPorts || req.body.OpenPorts || [];
+    const { ports, total, disallowed } = await evaluatePorts(rawPorts);
+
     // Upsert Device document
     let device = await Device.findOne({
       $or: [{ deviceId: deviceId }, { name: hostName }]
@@ -890,6 +1086,15 @@ router.post('/register', async (req, res) => {
         lastSync: new Date().toISOString(),
         status: 'applied',
         online: true,
+        ipAddress,
+        publicIp,
+        macAddress,
+        location,
+        firewallStatus,
+        firewallEnabled,
+        openPorts: ports,
+        openPortsCount: total,
+        disallowedPortsCount: disallowed,
       });
       await device.save();
 
@@ -911,7 +1116,39 @@ router.post('/register', async (req, res) => {
       if (agentVersion) device.agentVersion = agentVersion;
       device.online = true;
       device.lastSync = new Date().toISOString();
+      device.ipAddress = ipAddress;
+      if (publicIp) device.publicIp = publicIp;
+      if (macAddress) device.macAddress = macAddress;
+      if (location) device.location = location;
+      device.firewallStatus = firewallStatus;
+      device.firewallEnabled = firewallEnabled;
+      device.openPorts = ports;
+      device.openPortsCount = total;
+      device.disallowedPortsCount = disallowed;
       await device.save();
+    }
+
+    // Process software list if provided on registration
+    const softwareList = req.body.softwareList || req.body.SoftwareList;
+    if (Array.isArray(softwareList) && softwareList.length > 0) {
+      for (const sw of softwareList) {
+        const swName = sw.name || sw.DisplayName;
+        if (!swName) continue;
+        await DeviceSoftware.findOneAndUpdate(
+          { deviceId, name: swName },
+          {
+            id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
+            deviceId,
+            name: swName,
+            executable: sw.executable || sw.Executable || '',
+            publisher: sw.publisher || sw.Publisher || 'Unknown',
+            version: sw.version || sw.DisplayVersion || '1.0.0',
+            status: 'installed',
+            lastUsed: new Date().toISOString(),
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        ).catch(() => {});
+      }
     }
 
     res.status(200).json({
@@ -921,6 +1158,330 @@ router.post('/register', async (req, res) => {
     });
   } catch (error) {
     console.error('[Device Register Error]', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1b. UNINSTALL workstation: Set status to offline and uninstalled (NEVER delete record)
+router.post('/:deviceId/uninstall', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    let device = await Device.findOne({
+      $or: [{ deviceId: deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+
+    if (!device) {
+      return res.status(404).json({ message: `Device '${deviceId}' not found.` });
+    }
+
+    device.online = false;
+    device.status = 'uninstalled';
+    device.unenrolledAt = new Date().toISOString();
+    await device.save();
+
+    await AuditLog.create({
+      id: `log-${Date.now().toString().slice(-6)}`,
+      action: 'Workstation Uninstalled',
+      category: 'device',
+      actor: device.employeeName || 'Installer',
+      target: `${device.name} (${device.deviceId})`,
+      timestamp: new Date().toISOString(),
+      details: `Workstation ${device.name} uninstalled. Status changed to Offline and uninstalled. Device record preserved in fleet database.`,
+    });
+
+    res.status(200).json({
+      message: 'Workstation uninstalled and marked offline. Record preserved.',
+      device,
+    });
+  } catch (error) {
+    console.error('[Device Uninstall Error]', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1c. GET active open ports & Master Allowed Ports comparison
+router.get('/:deviceId/ports', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const device = await Device.findOne({
+      $or: [{ deviceId: deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+
+    if (!device) return res.status(404).json({ message: 'Device not found' });
+
+    let masterPorts = await MasterPort.find({ active: true }).sort({ port: 1 }).lean().catch(() => []);
+    if (!masterPorts || masterPorts.length === 0) {
+      masterPorts = [
+        { port: 80, protocol: 'TCP', serviceName: 'HTTP', description: 'Standard Web' },
+        { port: 443, protocol: 'TCP', serviceName: 'HTTPS', description: 'Secure Web' },
+        { port: 53, protocol: 'UDP', serviceName: 'DNS', description: 'Domain Resolution' },
+        { port: 123, protocol: 'UDP', serviceName: 'NTP', description: 'Time Sync' },
+        { port: 22, protocol: 'TCP', serviceName: 'SSH', description: 'Secure Shell' },
+      ];
+    }
+
+    // Merge any blockedPorts so they are always visible in the management UI
+    const mergedPorts = [...(device.openPorts || [])];
+    const blockedList = device.blockedPorts || [];
+    for (const bp of blockedList) {
+      const pNum = Number(bp.port);
+      const proto = (bp.protocol || 'TCP').toUpperCase();
+      const existing = mergedPorts.find(p => p.port === pNum && (p.protocol || 'TCP').toUpperCase() === proto);
+      if (existing) {
+        existing.isBlocked = true;
+      } else {
+        mergedPorts.push({
+          port: pNum,
+          protocol: proto,
+          processName: bp.reason || 'Blocked by Policy',
+          isAllowed: false,
+          isBlocked: true,
+        });
+      }
+    }
+
+    res.json({
+      deviceId: device.deviceId,
+      deviceName: device.name,
+      openPorts: mergedPorts,
+      openPortsCount: mergedPorts.length,
+      disallowedPortsCount: device.disallowedPortsCount || 0,
+      blockedPorts: device.blockedPorts || [],
+      masterPorts,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1c-2. POST Block Port on Device
+router.post('/:deviceId/block-port', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { port, protocol, reason } = req.body;
+    const portNum = Number(port);
+    if (!portNum) return res.status(400).json({ message: 'Valid port number is required' });
+
+    const device = await Device.findOne({
+      $or: [{ deviceId: deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    if (!device) return res.status(404).json({ message: 'Device not found' });
+
+    if (!Array.isArray(device.blockedPorts)) device.blockedPorts = [];
+    const exists = device.blockedPorts.some((p) => p.port === portNum);
+    if (!exists) {
+      device.blockedPorts.push({
+        port: portNum,
+        protocol: (protocol || 'TCP').toUpperCase(),
+        blockedAt: new Date().toISOString(),
+        reason: reason || 'Manual Admin Block',
+      });
+    }
+
+    // Re-evaluate openPorts
+    let rawList = device.openPorts || [];
+    if (!rawList.some((p) => p.port === portNum)) {
+      rawList.push({
+        port: portNum,
+        protocol: (protocol || 'TCP').toUpperCase(),
+        processName: 'Blocked by Policy',
+        isAllowed: false,
+        isBlocked: true,
+      });
+    }
+    const { ports, total, disallowed } = await evaluatePorts(rawList, device.blockedPorts);
+    device.openPorts = ports;
+    device.openPortsCount = total;
+    device.disallowedPortsCount = disallowed;
+    await device.save();
+
+    await AuditLog.create({
+      id: `log-${Date.now()}`,
+      action: 'Port Blocked',
+      category: 'security',
+      actor: 'Admin',
+      target: `${device.name} (Port ${portNum})`,
+      timestamp: new Date().toISOString(),
+      details: `Admin blocked listening port ${portNum} on ${device.name}`,
+    });
+
+    res.json({ message: `Port ${portNum} blocked successfully`, device });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1c-3. POST Unblock Port on Device
+router.post('/:deviceId/unblock-port', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { port } = req.body;
+    const portNum = Number(port);
+    if (!portNum) return res.status(400).json({ message: 'Valid port number is required' });
+
+    const device = await Device.findOne({
+      $or: [{ deviceId: deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    if (!device) return res.status(404).json({ message: 'Device not found' });
+
+    if (Array.isArray(device.blockedPorts)) {
+      device.blockedPorts = device.blockedPorts.filter((p) => p.port !== portNum);
+    }
+
+    const { ports, total, disallowed } = await evaluatePorts(device.openPorts || [], device.blockedPorts || []);
+    device.openPorts = ports;
+    device.openPortsCount = total;
+    device.disallowedPortsCount = disallowed;
+    await device.save();
+
+    await AuditLog.create({
+      id: `log-${Date.now()}`,
+      action: 'Port Unblocked',
+      category: 'security',
+      actor: 'Admin',
+      target: `${device.name} (Port ${portNum})`,
+      timestamp: new Date().toISOString(),
+      details: `Admin unblocked port ${portNum} on ${device.name}`,
+    });
+
+    res.json({ message: `Port ${portNum} unblocked successfully`, device });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1c-4. POST Toggle Windows Defender Firewall (ON / OFF)
+router.post('/:deviceId/toggle-firewall', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { enabled } = req.body;
+    const isEnabling = enabled === true;
+    const targetState = isEnabling ? 'on' : 'off';
+
+    const device = await Device.findOne({
+      $or: [{ deviceId: deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    if (!device) return res.status(404).json({ message: 'Device not found' });
+
+    device.targetFirewallState = targetState;
+    device.firewallEnabled = isEnabling;
+    device.firewallStatus = isEnabling ? 'enabled' : 'disabled';
+    await device.save();
+
+    await AuditLog.create({
+      id: `log-${Date.now()}`,
+      action: isEnabling ? 'Firewall Remotely Enabled' : 'Firewall Remotely Disabled',
+      category: 'security',
+      actor: 'Admin',
+      target: `${device.name} (${device.deviceId})`,
+      timestamp: new Date().toISOString(),
+      details: `Admin remotely set Windows Defender Firewall to ${targetState.toUpperCase()} on workstation ${device.name}`,
+    });
+
+    res.json({
+      message: `Windows Defender Firewall set to ${targetState.toUpperCase()} on ${device.name}`,
+      device,
+      targetFirewallState: targetState,
+      firewallEnabled: isEnabling,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1d. GET software inventory for a device
+router.get('/:deviceId/software', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { filter } = req.query; // 'installed', 'frequently_used', 'uninstalled', 'all'
+
+    // Resolve target device to support querying by custom id (dev-001), computer name, or machine GUID
+    const targetDev = await Device.findOne({
+      $or: [{ deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    const resolvedDeviceId = targetDev ? targetDev.deviceId : deviceId;
+    const query = { deviceId: resolvedDeviceId };
+
+    if (filter === 'installed') query.status = 'installed';
+    else if (filter === 'uninstalled') query.status = 'uninstalled';
+
+    let list = await DeviceSoftware.find(query).sort({ executionCount: -1, name: 1 }).lean();
+    if (filter === 'frequently_used') {
+      list = list.filter((item) => item.status === 'installed' && (item.executionCount > 0 || item.executionCount === undefined));
+    }
+
+    // Correlate with active blocked application rules
+    const blockedRules = await ApplicationRule.find({ action: 'block' }).lean();
+    const blockedExes = new Set(
+      blockedRules.map((r) => (r.executableName || r.appName || '').toLowerCase().trim())
+    );
+
+    const enriched = list.map((item) => {
+      const cleanExe = (item.executable || `${item.name.toLowerCase().replace(/\s+/g, '')}.exe`).toLowerCase().trim();
+      const isBlocked = blockedExes.has(cleanExe) || blockedExes.has(item.name.toLowerCase().trim());
+      return {
+        ...item,
+        isBlocked,
+      };
+    });
+
+    res.json({
+      deviceId: resolvedDeviceId,
+      total: enriched.length,
+      software: enriched,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1e. POST sync software inventory from agent
+router.post('/:deviceId/software', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { softwareList } = req.body;
+    if (!Array.isArray(softwareList)) {
+      return res.status(400).json({ message: 'softwareList array is required' });
+    }
+
+    const currentNames = new Set();
+    for (const app of softwareList) {
+      const name = app.name || app.DisplayName;
+      if (!name) continue;
+      currentNames.add(name);
+
+      const exe = app.executable || app.Executable || '';
+      const publisher = app.publisher || app.Publisher || 'Unknown';
+      const version = app.version || app.DisplayVersion || '1.0.0';
+      const count = app.executionCount || app.ExecutionCount || 0;
+
+      await DeviceSoftware.findOneAndUpdate(
+        { deviceId, name },
+        {
+          id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
+          deviceId,
+          name,
+          executable: exe,
+          publisher,
+          version,
+          status: 'installed',
+          $inc: { executionCount: count > 0 ? count : 0 },
+          lastUsed: new Date().toISOString(),
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).catch(() => {});
+    }
+
+    // Mark missing apps as uninstalled
+    if (currentNames.size > 0) {
+      await DeviceSoftware.updateMany(
+        { deviceId, name: { $nin: Array.from(currentNames) }, status: 'installed' },
+        { status: 'uninstalled', updatedAt: new Date().toISOString() }
+      ).catch(() => {});
+    }
+
+    res.json({ message: 'Software inventory synchronized', count: softwareList.length });
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
@@ -1092,7 +1653,10 @@ router.get('/:deviceId/policy', async (req, res) => {
     const ruleKeys = agentWebsiteRules.map(r => r.domain).sort().join(',');
     const appKeys = agentApplicationRules.map(r => r.executableName).sort().join(',');
     const browserKeys = Object.entries(agentBrowserRule).map(([k, v]) => `${k}:${v}`).join(',');
-    const fingerprint = `${ruleKeys}::${appKeys}::${effectiveUsbAction}::${browserKeys}`;
+    const blockedPorts = (device.blockedPorts || []).map(p => Number(p.port));
+    const portKeys = blockedPorts.sort((a, b) => a - b).join(',');
+    const fwState = device.targetFirewallState || (device.firewallEnabled !== false ? 'on' : 'off');
+    const fingerprint = `${ruleKeys}::${appKeys}::${effectiveUsbAction}::${browserKeys}::${portKeys}::${fwState}`;
 
     let hash = 5381;
     for (let i = 0; i < fingerprint.length; i++) {
@@ -1110,6 +1674,8 @@ router.get('/:deviceId/policy', async (req, res) => {
       applicationRules: agentApplicationRules,
       usbRule: agentUsbRule,
       browserRule: agentBrowserRule,
+      blockedPorts: blockedPorts,
+      enforceFirewallEnabled: fwState === 'on',
     });
   } catch (error) {
     console.error('[Device Get Policy Error]', error);
@@ -1147,6 +1713,17 @@ router.post('/:deviceId/policy-status', async (req, res) => {
     device.lastSync = appliedAt;
     device.online = true;
     if (policyId) device.policyId = policyId;
+    if (req.body.ipAddress || req.body.IpAddress) device.ipAddress = req.body.ipAddress || req.body.IpAddress;
+    if (req.body.macAddress || req.body.MacAddress) device.macAddress = req.body.macAddress || req.body.MacAddress;
+    if (req.body.firewallStatus || req.body.FirewallStatus) device.firewallStatus = req.body.firewallStatus || req.body.FirewallStatus;
+    if (req.body.firewallEnabled !== undefined) device.firewallEnabled = req.body.firewallEnabled;
+    if (req.body.FirewallEnabled !== undefined) device.firewallEnabled = req.body.FirewallEnabled;
+    if (req.body.openPorts || req.body.OpenPorts) {
+      const { ports, total, disallowed } = await evaluatePorts(req.body.openPorts || req.body.OpenPorts, device.blockedPorts || []);
+      device.openPorts = ports;
+      device.openPortsCount = total;
+      device.disallowedPortsCount = disallowed;
+    }
     await device.save();
 
     // Only record audit log if status or policy version changed or error occurred (prevents 60s duplicate spam)
@@ -1282,9 +1859,9 @@ router.delete('/:id', async (req, res) => {
       AuditLog.create({
         id: `log-${Date.now().toString().slice(-6)}`,
         action: 'device_deleted',
-        category: 'devices',
+        category: 'device',
         target: deleted.name,
-        user: 'WRMS Uninstaller',
+        actor: 'WRMS Uninstaller',
         timestamp: new Date().toISOString(),
         details: `Workstation ${deleted.name} (${deleted.deviceId}) uninstalled and permanently removed from fleet database`,
       }).catch(() => {}),

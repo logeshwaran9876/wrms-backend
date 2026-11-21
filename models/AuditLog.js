@@ -6,7 +6,7 @@ const auditLogSchema = new mongoose.Schema(
     action: { type: String, required: true },
     category: {
       type: String,
-      enum: ['auth', 'policy', 'website', 'application', 'permission', 'device'],
+      enum: ['auth', 'policy', 'website', 'application', 'permission', 'device', 'devices', 'security', 'usb', 'port', 'software'],
       required: true,
     },
     actor: { type: String, required: true },

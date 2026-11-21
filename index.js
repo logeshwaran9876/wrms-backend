@@ -120,7 +120,7 @@ async function startServer() {
       $or: [{ passwordHash: { $exists: false } }, { passwordHash: null }],
     });
     for (const u of unhashedUsers) {
-      const defaultPwd = u.email === 'admin@company.com' ? 'Admin@12345' : 'Logesh@12345';
+      const defaultPwd = u.email === 'admin@company.com' ? 'Admin@12345' : 'Employee@12345';
       const { hash, salt } = hashPassword(defaultPwd);
       u.passwordHash = hash;
       u.passwordSalt = salt;

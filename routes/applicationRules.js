@@ -1,6 +1,7 @@
 import express from 'express';
 import { ApplicationRule } from '../models/ApplicationRule.js';
 import { AuditLog } from '../models/AuditLog.js';
+import { DeviceSoftware } from '../models/DeviceSoftware.js';
 
 const router = express.Router();
 
@@ -13,6 +14,97 @@ export function normalizeExecutable(input) {
   }
   return str;
 }
+
+// 1-Click block installed software directly from Inventory
+router.post('/block-installed', async (req, res) => {
+  try {
+    const { appName, executable, publisher, scope, scopeTarget } = req.body;
+    if (!appName || !appName.trim()) {
+      return res.status(400).json({ message: 'appName is required' });
+    }
+    const cleanExe = normalizeExecutable(executable || appName);
+    const ruleScope = scope || 'global';
+
+    let rule = await ApplicationRule.findOne({
+      $or: [
+        { executableName: cleanExe, scope: ruleScope },
+        { appName: appName.trim(), scope: ruleScope },
+      ],
+    });
+
+    if (rule) {
+      rule.action = 'block';
+      rule.executableName = cleanExe;
+      await rule.save();
+    } else {
+      rule = new ApplicationRule({
+        id: `a-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        appName: appName.trim(),
+        executableName: cleanExe,
+        publisher: publisher || 'Unknown',
+        action: 'block',
+        scope: ruleScope,
+        scopeTarget: ruleScope !== 'global' ? scopeTarget : undefined,
+        createdAt: new Date().toISOString(),
+      });
+      await rule.save();
+    }
+
+    // Update software inventory blocked state
+    await DeviceSoftware.updateMany(
+      { executable: new RegExp(`^${cleanExe}$`, 'i') },
+      { $set: { isBlocked: true } }
+    );
+
+    await AuditLog.create({
+      id: `log-${Date.now().toString().slice(-6)}`,
+      action: 'Application Blocked',
+      category: 'policy',
+      actor: 'Admin',
+      target: `${appName} (${cleanExe})`,
+      timestamp: new Date().toISOString(),
+      details: `Installed application ${appName} (${cleanExe}) was added to Application Control blocklist from software inventory.`,
+    });
+
+    res.status(200).json({ message: 'Application blocked successfully', rule });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1-Click unblock installed software
+router.post('/unblock-installed', async (req, res) => {
+  try {
+    const { executable } = req.body;
+    if (!executable) {
+      return res.status(400).json({ message: 'executable is required' });
+    }
+    const cleanExe = normalizeExecutable(executable);
+
+    await ApplicationRule.deleteMany({
+      executableName: new RegExp(`^${cleanExe}$`, 'i'),
+    });
+
+    await DeviceSoftware.updateMany(
+      { executable: new RegExp(`^${cleanExe}$`, 'i') },
+      { $set: { isBlocked: false } }
+    );
+
+    await AuditLog.create({
+      id: `log-${Date.now().toString().slice(-6)}`,
+      action: 'Application Unblocked',
+      category: 'policy',
+      actor: 'Admin',
+      target: cleanExe,
+      timestamp: new Date().toISOString(),
+      details: `Application ${cleanExe} was unblocked from Application Control blocklist.`,
+    });
+
+    res.status(200).json({ message: 'Application unblocked successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
 
 // GET all application rules
 router.get('/', async (req, res) => {
