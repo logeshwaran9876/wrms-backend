@@ -48,28 +48,10 @@ export async function seedDatabase(force = false) {
       return await cleanAndInitializeDatabase();
     }
 
-    console.log(`[Seed] Seeding MongoDB with initial data from mockData (force=true)...`);
+    console.log(`[Seed] Seeding MongoDB with initial data from (force=true)...`);
 
     // Clear existing collections if forcing
-    if (force || userCount === 0) {
-      await Promise.all([
-        User.deleteMany({}),
-        Department.deleteMany({}),
-        Device.deleteMany({}),
-        WebsiteRule.deleteMany({}),
-        ApplicationRule.deleteMany({}),
-        BrowserRule.deleteMany({}),
-        UsbRule.deleteMany({}),
-        Policy.deleteMany({}),
-        AuditLog.deleteMany({}),
-        Notification.deleteMany({}),
-        BlockedAccessEvent.deleteMany({}),
-        RecentAdminAction.deleteMany({}),
-        WebsiteAccessTrend.deleteMany({}),
-        BlockedCategory.deleteMany({}),
-        PolicyCompliance.deleteMany({}),
-      ]);
-    }
+   
 
     // Insert all datasets
     const [
