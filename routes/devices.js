@@ -1128,26 +1128,43 @@ router.post('/register', async (req, res) => {
       await device.save();
     }
 
-    // Process software list if provided on registration
+    // Process software list if provided on registration (bulk write for ultra-fast performance)
     const softwareList = req.body.softwareList || req.body.SoftwareList;
     if (Array.isArray(softwareList) && softwareList.length > 0) {
+      const bulkOps = [];
       for (const sw of softwareList) {
         const swName = sw.name || sw.DisplayName;
         if (!swName) continue;
-        await DeviceSoftware.findOneAndUpdate(
-          { deviceId, name: swName },
-          {
+        const count = sw.executionCount || sw.ExecutionCount || 0;
+        const updateDoc = {
+          $setOnInsert: {
             id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
             deviceId,
             name: swName,
+          },
+          $set: {
             executable: sw.executable || sw.Executable || '',
             publisher: sw.publisher || sw.Publisher || 'Unknown',
             version: sw.version || sw.DisplayVersion || '1.0.0',
             status: 'installed',
             lastUsed: new Date().toISOString(),
           },
-          { upsert: true, new: true, setDefaultsOnInsert: true }
-        ).catch(() => {});
+        };
+        if (count > 0) {
+          updateDoc.$set.executionCount = count;
+        }
+        bulkOps.push({
+          updateOne: {
+            filter: { deviceId, name: swName },
+            update: updateDoc,
+            upsert: true,
+          },
+        });
+      }
+      if (bulkOps.length > 0) {
+        await DeviceSoftware.bulkWrite(bulkOps, { ordered: false }).catch((err) => {
+          console.error('[Device Register Software Bulk Error]', err.message);
+        });
       }
     }
 
@@ -1445,6 +1462,7 @@ router.post('/:deviceId/software', async (req, res) => {
     }
 
     const currentNames = new Set();
+    const bulkOps = [];
     for (const app of softwareList) {
       const name = app.name || app.DisplayName;
       if (!name) continue;
@@ -1455,21 +1473,38 @@ router.post('/:deviceId/software', async (req, res) => {
       const version = app.version || app.DisplayVersion || '1.0.0';
       const count = app.executionCount || app.ExecutionCount || 0;
 
-      await DeviceSoftware.findOneAndUpdate(
-        { deviceId, name },
-        {
+      const updateDoc = {
+        $setOnInsert: {
           id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
           deviceId,
           name,
+        },
+        $set: {
           executable: exe,
           publisher,
           version,
           status: 'installed',
-          $inc: { executionCount: count > 0 ? count : 0 },
           lastUsed: new Date().toISOString(),
         },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      ).catch(() => {});
+      };
+
+      if (count > 0) {
+        updateDoc.$max = { executionCount: count };
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { deviceId, name },
+          update: updateDoc,
+          upsert: true,
+        },
+      });
+    }
+
+    if (bulkOps.length > 0) {
+      await DeviceSoftware.bulkWrite(bulkOps, { ordered: false }).catch((err) => {
+        console.error('[Software Bulk Sync Error]:', err.message);
+      });
     }
 
     // Mark missing apps as uninstalled
@@ -1718,8 +1753,9 @@ router.post('/:deviceId/policy-status', async (req, res) => {
     if (req.body.firewallStatus || req.body.FirewallStatus) device.firewallStatus = req.body.firewallStatus || req.body.FirewallStatus;
     if (req.body.firewallEnabled !== undefined) device.firewallEnabled = req.body.firewallEnabled;
     if (req.body.FirewallEnabled !== undefined) device.firewallEnabled = req.body.FirewallEnabled;
-    if (req.body.openPorts || req.body.OpenPorts) {
-      const { ports, total, disallowed } = await evaluatePorts(req.body.openPorts || req.body.OpenPorts, device.blockedPorts || []);
+    const incomingPorts = req.body.openPorts !== undefined ? req.body.openPorts : req.body.OpenPorts;
+    if (Array.isArray(incomingPorts)) {
+      const { ports, total, disallowed } = await evaluatePorts(incomingPorts, device.blockedPorts || []);
       device.openPorts = ports;
       device.openPortsCount = total;
       device.disallowedPortsCount = disallowed;
