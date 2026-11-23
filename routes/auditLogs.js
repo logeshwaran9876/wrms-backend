@@ -1,5 +1,6 @@
 import express from 'express';
 import { AuditLog } from '../models/AuditLog.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -28,12 +29,13 @@ router.get('/', async (req, res) => {
     const { search, category, page, limit } = req.query;
     const filter = {};
     if (category && category !== 'all') filter.category = category;
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { action: { $regex: search, $options: 'i' } },
-        { actor: { $regex: search, $options: 'i' } },
-        { target: { $regex: search, $options: 'i' } },
-        { details: { $regex: search, $options: 'i' } },
+        { action: { $regex: esc, $options: 'i' } },
+        { actor: { $regex: esc, $options: 'i' } },
+        { target: { $regex: esc, $options: 'i' } },
+        { details: { $regex: esc, $options: 'i' } },
       ];
     }
 
@@ -78,12 +80,13 @@ router.get('/export/csv', async (req, res) => {
     const { category, search } = req.query;
     const filter = {};
     if (category && category !== 'all') filter.category = category;
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { action: { $regex: search, $options: 'i' } },
-        { actor: { $regex: search, $options: 'i' } },
-        { target: { $regex: search, $options: 'i' } },
-        { details: { $regex: search, $options: 'i' } },
+        { action: { $regex: esc, $options: 'i' } },
+        { actor: { $regex: esc, $options: 'i' } },
+        { target: { $regex: esc, $options: 'i' } },
+        { details: { $regex: esc, $options: 'i' } },
       ];
     }
 

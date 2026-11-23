@@ -6,6 +6,7 @@ import { ApplicationRule } from '../models/ApplicationRule.js';
 import { BrowserRule } from '../models/BrowserRule.js';
 import { UsbRule } from '../models/UsbRule.js';
 import { Device } from '../models/Device.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -28,10 +29,11 @@ router.get('/', async (req, res) => {
     if (active !== undefined && active !== 'all') {
       filter.active = active === 'true';
     }
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
+        { name: { $regex: esc, $options: 'i' } },
+        { description: { $regex: esc, $options: 'i' } },
       ];
     }
 

@@ -2,8 +2,11 @@ import express from 'express';
 import { ApplicationRule } from '../models/ApplicationRule.js';
 import { AuditLog } from '../models/AuditLog.js';
 import { DeviceSoftware } from '../models/DeviceSoftware.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
+
+export { escapeRegex };
 
 export function normalizeExecutable(input) {
   if (!input) return '';
@@ -23,11 +26,12 @@ router.post('/block-installed', async (req, res) => {
       return res.status(400).json({ message: 'appName is required' });
     }
     const cleanExe = normalizeExecutable(executable || appName);
+    const escapedExe = escapeRegex(cleanExe);
     const ruleScope = scope || 'global';
 
     let rule = await ApplicationRule.findOne({
       $or: [
-        { executableName: cleanExe, scope: ruleScope },
+        { executableName: new RegExp(`^${escapedExe}$`, 'i'), scope: ruleScope },
         { appName: appName.trim(), scope: ruleScope },
       ],
     });
@@ -52,7 +56,7 @@ router.post('/block-installed', async (req, res) => {
 
     // Update software inventory blocked state
     await DeviceSoftware.updateMany(
-      { executable: new RegExp(`^${cleanExe}$`, 'i') },
+      { executable: new RegExp(`^${escapedExe}$`, 'i') },
       { $set: { isBlocked: true } }
     );
 
@@ -80,13 +84,14 @@ router.post('/unblock-installed', async (req, res) => {
       return res.status(400).json({ message: 'executable is required' });
     }
     const cleanExe = normalizeExecutable(executable);
+    const escapedExe = escapeRegex(cleanExe);
 
     await ApplicationRule.deleteMany({
-      executableName: new RegExp(`^${cleanExe}$`, 'i'),
+      executableName: new RegExp(`^${escapedExe}$`, 'i'),
     });
 
     await DeviceSoftware.updateMany(
-      { executable: new RegExp(`^${cleanExe}$`, 'i') },
+      { executable: new RegExp(`^${escapedExe}$`, 'i') },
       { $set: { isBlocked: false } }
     );
 
@@ -113,11 +118,12 @@ router.get('/', async (req, res) => {
     const filter = {};
     if (action && action !== 'all') filter.action = action;
     if (scope && scope !== 'all') filter.scope = scope;
-    if (search) {
+    if (search && search.trim()) {
+      const escaped = escapeRegex(search.trim());
       filter.$or = [
-        { appName: { $regex: search, $options: 'i' } },
-        { executableName: { $regex: search, $options: 'i' } },
-        { publisher: { $regex: search, $options: 'i' } },
+        { appName: { $regex: escaped, $options: 'i' } },
+        { executableName: { $regex: escaped, $options: 'i' } },
+        { publisher: { $regex: escaped, $options: 'i' } },
       ];
     }
     const rules = await ApplicationRule.find(filter).sort({ createdAt: -1 });

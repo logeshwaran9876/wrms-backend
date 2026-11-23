@@ -10,6 +10,7 @@ import { DeviceSoftware } from '../models/DeviceSoftware.js';
 import { MasterPort } from '../models/MasterPort.js';
 import { normalizeDomain } from './websiteRules.js';
 import { normalizeExecutable } from './applicationRules.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -181,11 +182,12 @@ router.get('/', async (req, res) => {
     const filter = {};
     if (status && status !== 'all') filter.status = status;
     if (departmentId && departmentId !== 'all') filter.departmentId = departmentId;
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { deviceId: { $regex: search, $options: 'i' } },
-        { employeeName: { $regex: search, $options: 'i' } },
+        { name: { $regex: esc, $options: 'i' } },
+        { deviceId: { $regex: esc, $options: 'i' } },
+        { employeeName: { $regex: esc, $options: 'i' } },
       ];
     }
     const devices = await Device.find(filter).sort({ name: 1 });
@@ -1551,9 +1553,9 @@ router.get('/:deviceId/policy', async (req, res) => {
     }
 
     // Query rules matching: global, device, or employee
-    const regexEmpName = device.employeeName ? new RegExp(`^${device.employeeName.trim()}$`, 'i') : null;
-    const regexDevId = device.deviceId ? new RegExp(`^${device.deviceId.trim()}$`, 'i') : null;
-    const regexHostName = device.name ? new RegExp(`^${device.name.trim()}$`, 'i') : null;
+    const regexEmpName = device.employeeName ? new RegExp(`^${escapeRegex(device.employeeName.trim())}$`, 'i') : null;
+    const regexDevId = device.deviceId ? new RegExp(`^${escapeRegex(device.deviceId.trim())}$`, 'i') : null;
+    const regexHostName = device.name ? new RegExp(`^${escapeRegex(device.name.trim())}$`, 'i') : null;
 
     const queryConditions = [{ scope: 'global' }];
     if (regexDevId) queryConditions.push({ scope: 'device', scopeTarget: { $regex: regexDevId } });
@@ -1876,12 +1878,13 @@ router.post('/:id/sync', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const target = req.params.id;
+    const escapedTarget = target ? escapeRegex(target) : '';
     const deleted = await Device.findOneAndDelete({
       $or: [
         { id: target },
         { deviceId: target },
         { name: target },
-        { name: new RegExp(`^${target}$`, 'i') },
+        { name: new RegExp(`^${escapedTarget}$`, 'i') },
       ],
     });
     if (!deleted) return res.status(404).json({ message: 'Device not found' });

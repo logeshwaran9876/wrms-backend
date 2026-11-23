@@ -1,5 +1,6 @@
 import express from 'express';
 import { Department } from '../models/Department.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -8,10 +9,11 @@ router.get('/', async (req, res) => {
   try {
     const { search } = req.query;
     const filter = {};
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
+        { name: { $regex: esc, $options: 'i' } },
+        { description: { $regex: esc, $options: 'i' } },
       ];
     }
     const departments = await Department.find(filter).sort({ name: 1 });

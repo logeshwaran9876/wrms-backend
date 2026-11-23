@@ -3,6 +3,7 @@ import { User } from '../models/User.js';
 import { AuditLog } from '../models/AuditLog.js';
 import { hashPassword, verifyPassword, generateToken } from '../utils/authUtils.js';
 import { authenticateToken } from '../middleware/auth.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -25,10 +26,11 @@ router.post('/login', async (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
+    const escapedEmail = escapeRegex(cleanEmail);
 
     // Find user (case-insensitive)
     let user = await User.findOne({
-      email: { $regex: new RegExp(`^${cleanEmail}$`, 'i') },
+      email: { $regex: new RegExp(`^${escapedEmail}$`, 'i') },
     });
 
     if (!user) {

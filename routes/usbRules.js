@@ -1,6 +1,7 @@
 import express from 'express';
 import { UsbRule } from '../models/UsbRule.js';
 import { AuditLog } from '../models/AuditLog.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 const router = express.Router();
 
@@ -11,10 +12,11 @@ router.get('/', async (req, res) => {
     const filter = {};
     if (action && action !== 'all') filter.action = action;
     if (scope && scope !== 'all') filter.scope = scope;
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { scopeTarget: { $regex: search, $options: 'i' } },
+        { name: { $regex: esc, $options: 'i' } },
+        { scopeTarget: { $regex: esc, $options: 'i' } },
       ];
     }
     const rules = await UsbRule.find(filter).sort({ createdAt: -1 });

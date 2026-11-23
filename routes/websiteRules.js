@@ -2,6 +2,7 @@ import express from 'express';
 import { WebsiteRule } from '../models/WebsiteRule.js';
 import { Device } from '../models/Device.js';
 import { AuditLog } from '../models/AuditLog.js';
+import { escapeRegex } from '../utils/regexUtils.js';
 
 export function normalizeDomain(raw) {
   if (!raw) return '';
@@ -22,10 +23,11 @@ router.get('/', async (req, res) => {
     const filter = {};
     if (action && action !== 'all') filter.action = action;
     if (scope && scope !== 'all') filter.scope = scope;
-    if (search) {
+    if (search && search.trim()) {
+      const esc = escapeRegex(search.trim());
       filter.$or = [
-        { domain: { $regex: search, $options: 'i' } },
-        { category: { $regex: search, $options: 'i' } },
+        { domain: { $regex: esc, $options: 'i' } },
+        { category: { $regex: esc, $options: 'i' } },
       ];
     }
     const rules = await WebsiteRule.find(filter).sort({ createdAt: -1 });
