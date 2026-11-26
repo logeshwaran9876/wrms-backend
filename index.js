@@ -31,13 +31,20 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust reverse proxy headers (e.g. Kubernetes NGINX Ingress X-Forwarded-For)
+app.set('trust proxy', 1);
+
 // Middleware
+const allowedOrigins = process.env.CLIENT_URL && process.env.CLIENT_URL !== '*'
+  ? process.env.CLIENT_URL.split(',').map((o) => o.trim()).filter(Boolean)
+  : '*';
+
 app.use(cors({
-  origin: '*',
+  origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Agent-Secret', 'X-Device-Id'],
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Request logger for API calls
 app.use((req, res, next) => {
@@ -51,11 +58,20 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check endpoint
+// Liveness probe endpoint (verifies Node.js process is responsive)
+app.get('/api/live', (req, res) => {
+  res.status(200).json({
+    status: 'alive',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Health / readiness check endpoint (returns 503 if MongoDB is not connected)
 app.get('/api/health', (req, res) => {
   const isConnected = mongoose.connection.readyState === 1;
-  res.json({
-    status: 'ok',
+  res.status(isConnected ? 200 : 503).json({
+    status: isConnected ? 'ok' : 'degraded',
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     database: {
@@ -128,13 +144,36 @@ async function startServer() {
       console.log(`[Auth] Initialized password for user ${u.email} (${u.role})`);
     }
 
-    app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`===============================================`);
       console.log(`  WRMS Express Server running on port ${PORT}`);
       console.log(`  Health Check: http://localhost:${PORT}/api/health`);
       console.log(`  MongoDB: ${process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/windows_monitoring'}`);
       console.log(`===============================================`);
     });
+
+    // Graceful shutdown for Kubernetes rolling updates (SIGTERM / SIGINT)
+    const shutdown = (signal) => {
+      console.log(`[Server] Received ${signal}. Shutting down gracefully...`);
+      server.close(async () => {
+        try {
+          await mongoose.connection.close();
+          console.log('[MongoDB] Connection closed cleanly.');
+          process.exit(0);
+        } catch (err) {
+          console.error('[MongoDB] Error closing connection:', err);
+          process.exit(1);
+        }
+      });
+
+      setTimeout(() => {
+        console.error('[Server] Forced shutdown after timeout.');
+        process.exit(1);
+      }, 10000).unref();
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);

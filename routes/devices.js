@@ -7,6 +7,7 @@ import { UsbRule } from '../models/UsbRule.js';
 import { BrowserRule } from '../models/BrowserRule.js';
 import { AuditLog } from '../models/AuditLog.js';
 import { DeviceSoftware } from '../models/DeviceSoftware.js';
+import { DailyAppUsage } from '../models/DailyAppUsage.js';
 import { MasterPort } from '../models/MasterPort.js';
 import { normalizeDomain } from './websiteRules.js';
 import { normalizeExecutable } from './applicationRules.js';
@@ -1143,17 +1144,18 @@ router.post('/register', async (req, res) => {
             id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
             deviceId,
             name: swName,
+            lastUsed: '',
           },
           $set: {
             executable: sw.executable || sw.Executable || '',
             publisher: sw.publisher || sw.Publisher || 'Unknown',
             version: sw.version || sw.DisplayVersion || '1.0.0',
             status: 'installed',
-            lastUsed: new Date().toISOString(),
+            executionCount: count,
           },
         };
         if (count > 0) {
-          updateDoc.$set.executionCount = count;
+          updateDoc.$set.lastUsed = new Date().toISOString();
         }
         bulkOps.push({
           updateOne: {
@@ -1480,18 +1482,19 @@ router.post('/:deviceId/software', async (req, res) => {
           id: `sw-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`,
           deviceId,
           name,
+          lastUsed: '',
         },
         $set: {
           executable: exe,
           publisher,
           version,
           status: 'installed',
-          lastUsed: new Date().toISOString(),
+          executionCount: count,
         },
       };
 
       if (count > 0) {
-        updateDoc.$max = { executionCount: count };
+        updateDoc.$set.lastUsed = new Date().toISOString();
       }
 
       bulkOps.push({
@@ -1518,6 +1521,263 @@ router.post('/:deviceId/software', async (req, res) => {
     }
 
     res.json({ message: 'Software inventory synchronized', count: softwareList.length });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1f. POST sync real daily foreground screen-time & launch usage from agent
+router.post('/:deviceId/app-usage', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { date, totalActiveSeconds = 0, totalIdleSeconds = 0, lastUpdatedAt, apps } = req.body;
+    if (!date || !Array.isArray(apps)) {
+      return res.status(400).json({ message: 'date and apps array are required' });
+    }
+
+    const targetDev = await Device.findOne({
+      $or: [{ deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    const resolvedDeviceId = targetDev ? targetDev.deviceId : deviceId;
+
+    const existing = await DailyAppUsage.findOne({ deviceId: resolvedDeviceId, date }).lean();
+    const mergedMap = new Map();
+
+    if (existing && Array.isArray(existing.apps)) {
+      for (const item of existing.apps) {
+        const key = (item.executable || item.appName || '').toLowerCase().trim();
+        if (!key) continue;
+        mergedMap.set(key, {
+          executable: item.executable,
+          appName: item.appName,
+          publisher: item.publisher || 'Unknown',
+          activeSeconds: Number(item.activeSeconds) || 0,
+          launchCount: Number(item.launchCount) || 0,
+          firstUsedAt: item.firstUsedAt || '',
+          lastUsedAt: item.lastUsedAt || '',
+        });
+      }
+    }
+
+    for (const raw of apps) {
+      const exe = (raw.executable || raw.Executable || '').trim();
+      const appName = (raw.appName || raw.AppName || exe).trim();
+      if (!exe && !appName) continue;
+      const key = (exe || appName).toLowerCase();
+
+      const activeSec = Math.max(0, Number(raw.activeSeconds ?? raw.ActiveSeconds ?? 0));
+      const launches = Math.max(0, Number(raw.launchCount ?? raw.LaunchCount ?? 0));
+      const firstUsed = raw.firstUsedAt || raw.FirstUsedAt || '';
+      const lastUsed = raw.lastUsedAt || raw.LastUsedAt || '';
+      const publisher = raw.publisher || raw.Publisher || 'Unknown';
+
+      const prev = mergedMap.get(key);
+      if (!prev) {
+        mergedMap.set(key, {
+          executable: exe || key,
+          appName,
+          publisher,
+          activeSeconds: activeSec,
+          launchCount: launches,
+          firstUsedAt: firstUsed,
+          lastUsedAt: lastUsed,
+        });
+      } else {
+        const resolvedFirst =
+          prev.firstUsedAt && firstUsed
+            ? (prev.firstUsedAt < firstUsed ? prev.firstUsedAt : firstUsed)
+            : (prev.firstUsedAt || firstUsed);
+        const resolvedLast =
+          prev.lastUsedAt && lastUsed
+            ? (prev.lastUsedAt > lastUsed ? prev.lastUsedAt : lastUsed)
+            : (prev.lastUsedAt || lastUsed);
+
+        mergedMap.set(key, {
+          executable: prev.executable || exe,
+          appName: appName && !appName.endsWith('.exe') ? appName : prev.appName,
+          publisher: publisher !== 'Unknown' ? publisher : prev.publisher,
+          activeSeconds: Math.max(prev.activeSeconds, activeSec),
+          launchCount: Math.max(prev.launchCount, launches),
+          firstUsedAt: resolvedFirst,
+          lastUsedAt: resolvedLast,
+        });
+      }
+    }
+
+    const mergedApps = Array.from(mergedMap.values()).sort(
+      (a, b) => b.activeSeconds - a.activeSeconds || b.launchCount - a.launchCount
+    );
+    const computedActiveSum = mergedApps.reduce((acc, a) => acc + (a.activeSeconds || 0), 0);
+    const finalTotalActive = Math.max(
+      Number(existing?.totalActiveSeconds || 0),
+      Number(totalActiveSeconds || 0),
+      computedActiveSum
+    );
+    const finalTotalIdle = Math.max(
+      Number(existing?.totalIdleSeconds || 0),
+      Number(totalIdleSeconds || 0)
+    );
+
+    await DailyAppUsage.findOneAndUpdate(
+      { deviceId: resolvedDeviceId, date },
+      {
+        $set: {
+          deviceId: resolvedDeviceId,
+          employeeId: targetDev?.employeeId || '',
+          employeeName: targetDev?.employeeName || '',
+          date,
+          totalActiveSeconds: finalTotalActive,
+          totalIdleSeconds: finalTotalIdle,
+          lastUpdatedAt: lastUpdatedAt || new Date().toISOString(),
+          apps: mergedApps,
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    // Sync real lastUsed & executionCount onto matching DeviceSoftware records (only for actively used apps)
+    const swBulkOps = mergedApps
+      .filter((a) => a.executable && (a.activeSeconds > 0 || a.launchCount > 0))
+      .map((a) => ({
+        updateMany: {
+          filter: {
+            deviceId: resolvedDeviceId,
+            executable: new RegExp(`^${escapeRegex(a.executable)}$`, 'i'),
+          },
+          update: {
+            $set: {
+              executionCount: a.launchCount,
+              lastUsed: a.lastUsedAt || new Date().toISOString(),
+            },
+          },
+        },
+      }));
+
+    if (swBulkOps.length > 0) {
+      await DeviceSoftware.bulkWrite(swBulkOps, { ordered: false }).catch(() => {});
+    }
+
+    res.json({
+      message: 'Daily app usage synchronized',
+      date,
+      appsCount: mergedApps.length,
+      totalActiveSeconds: finalTotalActive,
+    });
+  } catch (error) {
+    console.error('[Daily App Usage Sync Error]:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// 1g. GET real daily / multi-day application screen-time usage for a device
+router.get('/:deviceId/app-usage', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { date, range = 'today' } = req.query;
+
+    const targetDev = await Device.findOne({
+      $or: [{ deviceId }, { id: deviceId }, { name: deviceId }],
+    });
+    const resolvedDeviceId = targetDev ? targetDev.deviceId : deviceId;
+
+    const allDatesDocs = await DailyAppUsage.find({ deviceId: resolvedDeviceId })
+      .select('date')
+      .sort({ date: -1 })
+      .limit(30)
+      .lean();
+    const availableDates = allDatesDocs.map((d) => d.date);
+
+    const blockedRules = await ApplicationRule.find({ action: 'block' }).lean();
+    const blockedExes = new Set(
+      blockedRules.map((r) => (r.executableName || r.appName || '').toLowerCase().trim())
+    );
+
+    const enrichApps = (appsList, totalSec) =>
+      appsList
+        .sort((a, b) => (b.activeSeconds || 0) - (a.activeSeconds || 0) || (b.launchCount || 0) - (a.launchCount || 0))
+        .map((app) => {
+          const exeLower = (app.executable || '').toLowerCase().trim();
+          const nameLower = (app.appName || '').toLowerCase().trim();
+          const isBlocked = blockedExes.has(exeLower) || blockedExes.has(nameLower);
+          const percentage = totalSec > 0 ? Math.round(((app.activeSeconds || 0) / totalSec) * 100) : 0;
+          return {
+            ...app,
+            percentage,
+            isBlocked,
+          };
+        });
+
+    if (range === '7d' || range === '30d') {
+      const daysCount = range === '30d' ? 30 : 7;
+      const endDate = date || new Date().toISOString().slice(0, 10);
+      const startObj = new Date(`${endDate}T00:00:00Z`);
+      startObj.setUTCDate(startObj.getUTCDate() - (daysCount - 1));
+      const startDate = startObj.toISOString().slice(0, 10);
+
+      const docs = await DailyAppUsage.find({
+        deviceId: resolvedDeviceId,
+        date: { $gte: startDate, $lte: endDate },
+      }).lean();
+
+      let totalActiveSeconds = 0;
+      let totalIdleSeconds = 0;
+      const aggMap = new Map();
+
+      for (const doc of docs) {
+        totalActiveSeconds += doc.totalActiveSeconds || 0;
+        totalIdleSeconds += doc.totalIdleSeconds || 0;
+        for (const app of doc.apps || []) {
+          const key = (app.executable || app.appName || '').toLowerCase().trim();
+          if (!key) continue;
+          const prev = aggMap.get(key);
+          if (!prev) {
+            aggMap.set(key, { ...app });
+          } else {
+            prev.activeSeconds += app.activeSeconds || 0;
+            prev.launchCount += app.launchCount || 0;
+            if (app.firstUsedAt && (!prev.firstUsedAt || app.firstUsedAt < prev.firstUsedAt)) {
+              prev.firstUsedAt = app.firstUsedAt;
+            }
+            if (app.lastUsedAt && (!prev.lastUsedAt || app.lastUsedAt > prev.lastUsedAt)) {
+              prev.lastUsedAt = app.lastUsedAt;
+            }
+          }
+        }
+      }
+
+      const aggregated = enrichApps(Array.from(aggMap.values()), totalActiveSeconds);
+      return res.json({
+        deviceId: resolvedDeviceId,
+        date: `${startDate}..${endDate}`,
+        range,
+        totalActiveSeconds,
+        totalIdleSeconds,
+        lastUpdatedAt: docs[0]?.lastUpdatedAt || null,
+        availableDates,
+        apps: aggregated,
+      });
+    }
+
+    const targetDate = date || new Date().toISOString().slice(0, 10);
+    let doc = await DailyAppUsage.findOne({ deviceId: resolvedDeviceId, date: targetDate }).lean();
+    if (!doc && !date && availableDates.length > 0) {
+      doc = await DailyAppUsage.findOne({ deviceId: resolvedDeviceId, date: availableDates[0] }).lean();
+    }
+
+    const totalActiveSeconds = doc?.totalActiveSeconds || 0;
+    const totalIdleSeconds = doc?.totalIdleSeconds || 0;
+    const enriched = enrichApps(doc?.apps || [], totalActiveSeconds);
+
+    res.json({
+      deviceId: resolvedDeviceId,
+      date: doc?.date || targetDate,
+      range: 'today',
+      totalActiveSeconds,
+      totalIdleSeconds,
+      lastUpdatedAt: doc?.lastUpdatedAt || null,
+      availableDates,
+      apps: enriched,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -1,0 +1,28 @@
+# WRMS Backend API Ingress (using *.oru.link single-level wildcard SSL: wrms-api.oru.link)
+# Routes https://wrms-api.oru.link/api/* directly to wrms-backend-service:80
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wrms-backend-ingress
+  namespace: wrms
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - wrms-api.oru.link
+      secretName: wrms-tls-secret
+  rules:
+    - host: wrms-api.oru.link
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: wrms-backend-service
+                port:
+                  number: 80

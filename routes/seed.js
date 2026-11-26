@@ -100,6 +100,10 @@ export async function seedDatabase(force = false) {
       },
     };
   } catch (error) {
+    if (!force && error?.code === 11000) {
+      console.log('[Seed] Concurrent pod startup already initialized database. Continuing.');
+      return { message: 'Concurrent seed already completed' };
+    }
     console.error(`[Seed] Seeding error:`, error);
     throw error;
   }
