@@ -28,6 +28,11 @@ const deviceSchema = new mongoose.Schema(
       country: { type: String, default: '' },
       countryCode: { type: String, default: '' },
       isp: { type: String, default: '' },
+      latitude: { type: Number },
+      longitude: { type: Number },
+      accuracyMeters: { type: Number },
+      source: { type: String, default: '' },
+      updatedAt: { type: String, default: '' },
     },
     firewallStatus: {
       type: String,

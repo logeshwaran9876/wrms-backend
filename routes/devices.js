@@ -20,8 +20,40 @@ const router = express.Router();
  * Queries free high-reliability geolocation service with rapid timeout.
  */
 export async function resolveDeviceLocation(ip) {
+  const isPrivate = !ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.');
+
+  // Primary GeoIP lookup via ipwho.is (HTTPS, coordinates, ISP)
   try {
-    const isPrivate = !ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.');
+    const url = isPrivate ? 'https://ipwho.is/' : `https://ipwho.is/${ip}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.success) {
+        return {
+          publicIp: data.ip || '',
+          location: {
+            city: data.city || '',
+            region: data.region || '',
+            country: data.country || '',
+            countryCode: data.country_code || '',
+            isp: data.connection?.isp || '',
+            latitude: typeof data.latitude === 'number' ? data.latitude : undefined,
+            longitude: typeof data.longitude === 'number' ? data.longitude : undefined,
+            accuracyMeters: 25000,
+            source: 'IP Geolocation (ISP)',
+            updatedAt: new Date().toISOString(),
+          },
+        };
+      }
+    }
+  } catch {
+    // Fallback to ip-api.com
+  }
+
+  try {
     const url = isPrivate ? 'http://ip-api.com/json' : `http://ip-api.com/json/${ip}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3500);
@@ -38,11 +70,16 @@ export async function resolveDeviceLocation(ip) {
             country: data.country || '',
             countryCode: data.countryCode || '',
             isp: data.isp || '',
+            latitude: typeof data.lat === 'number' ? data.lat : undefined,
+            longitude: typeof data.lon === 'number' ? data.lon : undefined,
+            accuracyMeters: 50000,
+            source: 'IP Geolocation (ISP)',
+            updatedAt: new Date().toISOString(),
           },
         };
       }
     }
-  } catch (err) {
+  } catch {
     // Network or timeout
   }
   return null;
@@ -2011,7 +2048,25 @@ router.post('/:deviceId/policy-status', async (req, res) => {
     device.online = true;
     if (policyId) device.policyId = policyId;
     if (req.body.ipAddress || req.body.IpAddress) device.ipAddress = req.body.ipAddress || req.body.IpAddress;
+    if (req.body.publicIp || req.body.PublicIp) device.publicIp = req.body.publicIp || req.body.PublicIp;
     if (req.body.macAddress || req.body.MacAddress) device.macAddress = req.body.macAddress || req.body.MacAddress;
+
+    const incomingLoc = req.body.location || req.body.Location;
+    if (incomingLoc && typeof incomingLoc === 'object') {
+      device.location = {
+        city: incomingLoc.city || incomingLoc.City || device.location?.city || '',
+        region: incomingLoc.region || incomingLoc.Region || device.location?.region || '',
+        country: incomingLoc.country || incomingLoc.Country || device.location?.country || '',
+        countryCode: incomingLoc.countryCode || incomingLoc.CountryCode || device.location?.countryCode || '',
+        isp: incomingLoc.isp || incomingLoc.Isp || device.location?.isp || '',
+        latitude: incomingLoc.latitude ?? incomingLoc.Latitude ?? device.location?.latitude,
+        longitude: incomingLoc.longitude ?? incomingLoc.Longitude ?? device.location?.longitude,
+        accuracyMeters: incomingLoc.accuracyMeters ?? incomingLoc.AccuracyMeters ?? device.location?.accuracyMeters,
+        source: incomingLoc.source || incomingLoc.Source || device.location?.source || '',
+        updatedAt: incomingLoc.updatedAt || incomingLoc.UpdatedAt || new Date().toISOString(),
+      };
+    }
+
     if (req.body.firewallStatus || req.body.FirewallStatus) device.firewallStatus = req.body.firewallStatus || req.body.FirewallStatus;
     if (req.body.firewallEnabled !== undefined) device.firewallEnabled = req.body.firewallEnabled;
     if (req.body.FirewallEnabled !== undefined) device.firewallEnabled = req.body.FirewallEnabled;
